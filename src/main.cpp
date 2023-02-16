@@ -26,6 +26,8 @@
 #include <boost/uuid/uuid_io.hpp>
 #include <boost/interprocess/sync/file_lock.hpp>
 
+#include <openssl/opensslv.h>
+
 namespace po = boost::program_options;
 using boost::property_tree::ptree;
 using std::cerr;
@@ -52,6 +54,7 @@ struct Options {
 	string hwid;
 	string uuid;
 	string name;
+        string hsm_store;
 	string hsm_module;
 	string hsm_so_pin;
 	string hsm_pin;
@@ -152,6 +155,9 @@ static bool _get_options(int argc, char **argv, Options &options)
 
 		("hsm-module,m", po::value<string>(&options.hsm_module),
 		 "The path to the PKCS#11 .so for the HSM, if using one.")
+
+                ("hsm-store,s", po::value<string>(&options.hsm_store),
+                "The path to the PKCS#11 store for the HSM, if using one [required for TPM].")
 
 		("hsm-so-pin,S", po::value<string>(&options.hsm_so_pin),
 		 "The PKCS#11 Security Officer PIN to set up on the HSM, if "
@@ -357,6 +363,101 @@ static void _unsetenv(const char *name)
 // 2. Otherwise, we initialize a token on the PKCS#11 HSM with label
 //    aktualizr, generate the keypair there (label tls, ID 01), and
 //    extract the public half. Return value is (key_file, csr).
+
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+static std::tuple<string, string> _create_cert(const Options& options, const string& uuid) {
+    TempDir tmp_dir;
+    string pkey;            // Private key data when no HSM used.
+    string pkey_file;       // Temporary file for private key when no HSM is used.
+
+    // Create the key.
+    if (options.hsm_module.empty()) {
+        // Create a file-based key.
+        pkey = _spawn("openssl ecparam -genkey -name prime256v1");
+        pkey_file = tmp_dir.GetPath() + "/pkey.pem";
+        std::ofstream pkey_out(pkey_file);
+        pkey_out << pkey << endl;
+        pkey_out.close();
+    } else {
+        // Initialize the HSM and create a key in it.
+        if (!options.hsm_store.empty()) {
+            // TPM requires the removal of the store before initialization
+            _spawn("rm " + options.hsm_store);
+        }
+
+        _pkcs11_tool(options.hsm_module,
+                     "--init-token --label " + hsm_token_label +
+                     " --so-pin " + options.hsm_so_pin);
+        _pkcs11_tool(options.hsm_module,
+                     "--init-pin --token-label " + hsm_token_label +
+                     " --so-pin " + options.hsm_so_pin +
+                     " --pin " + options.hsm_pin);
+        _pkcs11_tool(options.hsm_module,
+                     "--keypairgen --key-type EC:prime256v1"
+                     " --token-label " + hsm_token_label +
+                     " --id " + hsm_tls_key_id +
+                     " --label " + hsm_tls_key_label,
+                     options.hsm_pin);
+    }
+
+    // Create a CSR.
+    string csr = tmp_dir.GetPath() + "/device.csr";
+    string cnf = tmp_dir.GetPath() + "/device.cnf";
+    std::ofstream cnf_out(cnf);
+    if (!options.hsm_module.empty()) {
+        cnf_out << "openssl_conf = openssl_init" << endl;
+        cnf_out << endl;
+        cnf_out << "[openssl_init]" << endl;
+        cnf_out << "providers = provider_sect" << endl;
+        cnf_out << endl;
+        cnf_out << "[provider_sect]" << endl;
+        cnf_out << "default = default_sect" << endl;
+        cnf_out << "pkcs11 = pkcs11_sect" << endl;
+        cnf_out << endl;
+        cnf_out << "[default_sect]" << endl;
+        cnf_out << "activate = 0" << endl;
+        cnf_out << "[pkcs11_sect]" << endl;
+        cnf_out << "module = /lib/x86_64-linux-gnu/ossl-modules/pkcs11.so" << endl;
+        cnf_out << "pkcs11-module-path = " << options.hsm_module << endl;
+        cnf_out << "activate = 0" << endl;
+        cnf_out << endl;
+    }
+    cnf_out << "[req]" << endl;
+    cnf_out << "prompt = no" << endl;
+    cnf_out << "distinguished_name = dn" << endl;
+    cnf_out << "req_extensions = ext" << endl;
+    cnf_out << "default_md = sha256" << endl;
+    cnf_out << endl;
+    cnf_out << "[dn]" << endl;
+    cnf_out << "CN=" << uuid << endl;
+    cnf_out << "OU=" << options.factory << endl;
+    if (options.is_prod) {
+        cnf_out << "businessCategory=production" << endl;
+    }
+    cnf_out << endl;
+    cnf_out << "[ext]" << endl;
+    cnf_out << "keyUsage=critical, digitalSignature" << endl;
+    cnf_out << "extendedKeyUsage=critical, clientAuth" << endl;
+    cnf_out.close();
+
+    if (options.hsm_module.empty()) {
+        csr = _spawn("openssl req -new -config " + cnf + " -key " + pkey_file);
+        return std::make_tuple(pkey, csr);
+    } else {
+        string key = "\"pkcs11:token=" + hsm_token_label +
+            ";object=" + hsm_tls_key_label +
+            ";type=private" +
+            ";pin-value=" + options.hsm_pin + "\"";
+        // For some stupid reason, using OPENSSL_CONF in the
+        // environment works fine here, while using openssl
+        // req -new -config doesn't work with engines.
+        _setenv("OPENSSL_CONF", cnf.c_str());
+        csr = _spawn("openssl req -new -key " + key);
+        _unsetenv("OPENSSL_CONF");
+        return std::make_tuple(hsm_tls_key_id, csr);
+    }
+}
+#else
 static std::tuple<string, string> _create_cert(const Options &options, const string& uuid)
 {
 	TempDir tmp_dir;
@@ -443,6 +544,7 @@ static std::tuple<string, string> _create_cert(const Options &options, const str
 		return std::make_tuple(hsm_tls_key_id, csr);
 	}
 }
+#endif
 
 static string _get_oauth_token(const string &factory, const string &device_uuid)
 {
@@ -717,13 +819,25 @@ int main(int argc, char **argv)
 			// We additionally write the entire p11 section. (We can't tell the server
 			// the PIN, and don't want to parse/modify TOML to add it, so just write
 			// the whole thing.)
+
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
 			out << endl;
-			out << "[p11]" << endl;
-			out << "module = \"" << options.hsm_module << "\"" << endl;
+                        out << "[pkcs11_sect]" << endl;
+                        out << "module = /lib/x86_64-linux-gnu/ossl-modules/pkcs11.so" << endl;
+                        out << "pkcs11-module-path = " << options.hsm_module << endl;
 			out << "pass = \"" << options.hsm_pin << "\"" << endl;
 			out << "tls_pkey_id = \"" << hsm_tls_key_id << "\"" << endl;
 			out << "tls_clientcert_id = \"" << hsm_client_cert_id << "\"" << endl;
 			out << endl;
+#else
+                        out << endl;
+                        out << "[p11]" << endl;
+                        out << "module = \"" << options.hsm_module << "\"" << endl;
+                        out << "pass = \"" << options.hsm_pin << "\"" << endl;
+                        out << "tls_pkey_id = \"" << hsm_tls_key_id << "\"" << endl;
+                        out << "tls_clientcert_id = \"" << hsm_client_cert_id << "\"" << endl;
+                        out << endl;
+#endif
 		}
 
 		out.close();
